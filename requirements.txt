@@ -1,0 +1,42 @@
+# Wake word training pipeline dependencies
+# Install inside the venv: pip install -r requirements.txt
+
+# Core audio
+librosa==0.10.2
+soundfile==0.12.1
+audiomentations==0.36.0
+
+# Data / ML utilities
+numpy==1.26.4
+tqdm==4.66.4
+requests==2.32.3
+scipy==1.12.0
+pyyaml==6.0.3
+
+# PyTorch (required by openwakeword training)
+torch==2.2.2
+torchinfo==1.8.0
+torchmetrics==1.8.2
+
+# ONNX export
+onnx==1.15.0
+
+# TensorFlow (TFLite export + validation)
+tensorflow==2.15.1
+
+# openWakeWord
+openwakeword==0.6.0
+speechbrain==1.1.0
+mutagen
+acoustics
+torch-audiomentations==0.12.0
+
+# Modern ONNX to TFLite Converter dependencies
+onnx2tf==1.20.0
+onnx-graphsurgeon==0.6.1
+sng4onnx==2.0.1
+onnxslim==0.1.92
+psutil==7.2.2
+
+# Azure TTS (optional – only needed for sample generation)
+azure-cognitiveservices-speech==1.38.0
