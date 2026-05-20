@@ -1,4 +1,5 @@
 # Wake word training pipeline dependencies
+# Python version: 3.9.6
 # Install inside the venv: pip install -r requirements.txt
 
 # Core audio
@@ -27,8 +28,8 @@ tensorflow==2.15.1
 # openWakeWord
 openwakeword==0.6.0
 speechbrain==1.1.0
-mutagen
-acoustics
+mutagen==1.47.0
+acoustics==0.2.6
 torch-audiomentations==0.12.0
 
 # Modern ONNX to TFLite Converter dependencies
