@@ -27,6 +27,7 @@ tensorflow==2.15.1
 
 # openWakeWord
 openwakeword==0.6.0
+pronouncing==0.2.0
 speechbrain==1.1.0
 mutagen==1.47.0
 acoustics==0.2.6
