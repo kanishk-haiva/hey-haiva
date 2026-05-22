@@ -24,6 +24,7 @@ onnx==1.15.0
 
 # TensorFlow (TFLite export + validation)
 tensorflow==2.15.1
+tf_keras==2.15.1
 
 # openWakeWord
 openwakeword==0.6.0
