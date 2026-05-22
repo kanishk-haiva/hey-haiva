@@ -12,6 +12,7 @@ AGENT_ID=${agentId}
 WORKSPACE_ID=${workspaceId}
 ORG_ID=${orgId}
 AGENT_NAME=${agentName}
+AZURE_KEY=${azureKey}
 
 # Path to the wake word training directory on the Jenkins server
 WAKEWORD_DIR=${WAKEWORD_DIR:-/opt/wakeword}
@@ -22,6 +23,7 @@ echo "  AGENT_ID     : $AGENT_ID"
 echo "  WORKSPACE_ID : $WORKSPACE_ID"
 echo "  ORG_ID       : $ORG_ID"
 echo "  AGENT_NAME   : $AGENT_NAME"
+echo "  AZURE_KEY    : $AZURE_KEY"
 echo "  WAKE_WORD    : $WAKE_WORD"
 echo "  WAKEWORD_DIR : $WAKEWORD_DIR"
 
