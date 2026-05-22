@@ -49,7 +49,10 @@ TRAIN_LOG=/tmp/wake_word_train_${WAKE_SLUG}.log
 
 cd "$WAKEWORD_DIR"
 
-AZURE_KEY=${AZURE_KEY:-"74d33e863fb84384b2cd6ed4b358bb87"}
+if [[ -z "${AZURE_KEY:-}" ]]; then
+    echo "Error: AZURE_KEY is not set. Add it as a Jenkins credential."
+    exit 1
+fi
 
 python3 train_wake_word.py \
     --wake_word "$WAKE_WORD" \
