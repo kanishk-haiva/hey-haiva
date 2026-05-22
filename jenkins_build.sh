@@ -56,7 +56,14 @@ if [[ -z "${AZURE_KEY:-}" ]]; then
     exit 1
 fi
 
-python3 train_wake_word.py \
+# Build Docker image (cached after first run)
+docker build -t wakeword-trainer "$WAKEWORD_DIR"
+
+# Run training inside Ubuntu 20.04 container (has OpenSSL 1.1 — required by Azure Speech SDK)
+docker run --rm \
+    -v "$WAKEWORD_DIR:/app" \
+    -e AZURE_KEY="$AZURE_KEY" \
+    wakeword-trainer \
     --wake_word "$WAKE_WORD" \
     --azure_key "$AZURE_KEY" \
     --force_retrain \
