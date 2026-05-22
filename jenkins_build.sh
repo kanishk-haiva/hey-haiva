@@ -49,10 +49,11 @@ TRAIN_LOG=/tmp/wake_word_train_${WAKE_SLUG}.log
 
 cd "$WAKEWORD_DIR"
 
-# Run training; --skip_tts uses existing WAVs, --force_retrain rebuilds model
+AZURE_KEY=${AZURE_KEY:-"74d33e863fb84384b2cd6ed4b358bb87"}
+
 python3 train_wake_word.py \
     --wake_word "$WAKE_WORD" \
-    --skip_tts \
+    --azure_key "$AZURE_KEY" \
     --force_retrain \
     2>&1 | tee "$TRAIN_LOG"
 
@@ -74,13 +75,14 @@ echo ""
 echo "=== Step 2: Copying TFLite model ==="
 
 TFLITE_SRC="$WAKEWORD_DIR/output_${WAKE_SLUG}/tflite/${WAKE_SLUG}_float32.tflite"
-TFLITE_DST="$WORKSPACE/assets/models/hey_haiva_float32.tflite"
+TFLITE_DST="$WORKSPACE/assets/models/${WAKE_SLUG}_float32.tflite"
 
 if [[ ! -f "$TFLITE_SRC" ]]; then
     echo "Error: trained model not found at $TFLITE_SRC"
     exit 1
 fi
 
+mkdir -p "$WORKSPACE/assets/models/"
 cp "$TFLITE_SRC" "$TFLITE_DST"
 echo "Model copied: $TFLITE_SRC → $TFLITE_DST"
 
@@ -98,13 +100,9 @@ dart run rename_app:main all="$AGENT_NAME"
 flutter build apk \
     --release \
     --dart-define=AGENT_ID="$AGENT_ID" \
+    --dart-define=WAKE_WORD="$WAKE_SLUG" \
     --dart-define=WAKE_THRESHOLD="$WAKE_THRESHOLD" \
     --target=lib/main.dart
-
-if [[ $? -ne 0 ]]; then
-    echo "Flutter build failed."
-    exit 1
-fi
 
 # Rename and archive APK
 mkdir -p "$WORKSPACE/artifacts"
