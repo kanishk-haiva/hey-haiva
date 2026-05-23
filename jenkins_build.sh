@@ -17,6 +17,7 @@ AZURE_KEY=${azureKey}
 # Path to the wake word training directory on the Jenkins server
 WAKEWORD_DIR=${WAKEWORD_DIR:-/opt/wakeword}
 WAKE_WORD=${WAKE_WORD:-"hey haiva"}
+FLUTTER_DIR=${FLUTTER_DIR:-$WORKSPACE}
 
 echo "=== Build parameters ==="
 echo "  AGENT_ID     : $AGENT_ID"
@@ -87,14 +88,14 @@ echo ""
 echo "=== Step 2: Copying TFLite model ==="
 
 TFLITE_SRC="$WAKEWORD_DIR/output_${WAKE_SLUG}/tflite/${WAKE_SLUG}_float32.tflite"
-TFLITE_DST="$WORKSPACE/assets/models/${WAKE_SLUG}_float32.tflite"
+TFLITE_DST="$FLUTTER_DIR/assets/models/${WAKE_SLUG}_float32.tflite"
 
 if [[ ! -f "$TFLITE_SRC" ]]; then
     echo "Error: trained model not found at $TFLITE_SRC"
     exit 1
 fi
 
-mkdir -p "$WORKSPACE/assets/models/"
+mkdir -p "$FLUTTER_DIR/assets/models/"
 cp "$TFLITE_SRC" "$TFLITE_DST"
 echo "Model copied: $TFLITE_SRC → $TFLITE_DST"
 
@@ -102,7 +103,7 @@ echo "Model copied: $TFLITE_SRC → $TFLITE_DST"
 echo ""
 echo "=== Step 3: Building Flutter APK ==="
 
-cd "$WORKSPACE"
+cd "$FLUTTER_DIR"
 
 flutter clean
 flutter pub get || { echo "flutter pub get failed"; exit 1; }
@@ -117,9 +118,9 @@ flutter build apk \
     --target=lib/main.dart
 
 # Rename and archive APK
-mkdir -p "$WORKSPACE/artifacts"
+mkdir -p "$FLUTTER_DIR/artifacts"
 APK_SRC=build/app/outputs/flutter-apk/app-release.apk
-APK_DST="$WORKSPACE/artifacts/app-release.apk"
+APK_DST="$FLUTTER_DIR/artifacts/app-release.apk"
 
 if [[ ! -f "$APK_SRC" ]]; then
     echo "APK not found at $APK_SRC"
