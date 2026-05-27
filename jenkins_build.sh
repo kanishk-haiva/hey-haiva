@@ -82,31 +82,9 @@ fi
 
 sudo docker login --username $docker_user --password $dockercreds
 
-# ── Auto-retrain quality thresholds (override in Jenkins env if needed) ───────
-# Retrain (without new TTS) whenever the model fails any of these checks:
-#
-#   MIN_F1             — harmonic mean of precision & recall on the validation set
-#   MIN_POSITIVE_SCORE — weakest positive must score above this; ensures the model
-#                        is confident enough that a safe threshold (>= 0.50) catches
-#                        all real wake words
-#
-# NOTE: max_negative and gap are NOT used as quality gates — a single TTS
-# artifact can push max_negative to ~1.0 even on an otherwise perfect model.
-# The threshold formula already handles high max_negative safely by capping
-# at min_positive × 0.90, so no retrain is needed for that case.
-#
-# NOTE: we do NOT check the sweep's "best threshold" directly — that value is
-# always the LOWEST threshold achieving max F1, so a perfect model with
-# min_pos=0.94 and max_neg=0.24 would report threshold=0.25 (correct but
-# misleadingly low). Instead we verify the raw score boundaries directly.
-MIN_F1=${MIN_F1:-0.85}
-MIN_POSITIVE_SCORE=${MIN_POSITIVE_SCORE:-0.70}  # all positives must score > 0.70
-MIN_SHIP_THRESHOLD=${MIN_SHIP_THRESHOLD:-0.50}  # shipped threshold floor (never hair-trigger)
-MAX_RETRAIN=${MAX_RETRAIN:-3}
-# Steps per attempt: [initial, retry-1, retry-2, retry-3]
-STEPS_SCHEDULE=(5000 7000 9000 12000)
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
+MIN_SHIP_THRESHOLD=${MIN_SHIP_THRESHOLD:-0.50}  # shipped threshold floor (never hair-trigger)
+
 parse_metrics() {
     local logfile="$1"
     WAKE_F1=$(grep "Best threshold:" "$logfile" | tail -1 \
@@ -118,22 +96,9 @@ parse_metrics() {
     WAKE_MAX_NEG=$(grep "max_negative" "$logfile" | tail -1 \
         | sed 's/.*= *\([0-9.]*\).*/\1/')
     # Compute a safe production threshold from the raw score boundaries:
-    #
-    #   raw = (min_pos + max_neg) / 2   — ideal midpoint
-    #   cap = min_pos × 0.90            — hard ceiling: threshold must always be
-    #                                     below the weakest positive so the wake word
-    #                                     still fires even from quieter real voices.
-    #                                     Without this, high max_neg (e.g. 0.996) can
-    #                                     push the midpoint above min_pos and the wake
-    #                                     word NEVER fires on device.
-    #   floor = MIN_SHIP_THRESHOLD      — hard floor (default 0.5): never hair-trigger
-    #
-    #   threshold = clamp(min(raw, cap), floor, cap)
-    #
-    # Examples:
-    #   Good model  min_pos=0.945 max_neg=0.239 → raw=0.592 cap=0.851 → 0.592 ✓
-    #   High neg    min_pos=0.882 max_neg=0.996 → raw=0.939 cap=0.794 → 0.794 ✓
-    #   Bad model   min_pos=0.200 max_neg=0.932 → raw=0.566 cap=0.180 → 0.500 (floored) ✓
+    #   raw = (min_pos + max_neg) / 2
+    #   cap = min_pos × 0.90  (threshold must stay below the weakest positive)
+    #   floor = MIN_SHIP_THRESHOLD (never hair-trigger)
     if [[ -n "$WAKE_MIN_POS" && -n "$WAKE_MAX_NEG" ]]; then
         WAKE_THRESHOLD=$(awk -v p="$WAKE_MIN_POS" -v n="$WAKE_MAX_NEG" \
             -v floor="$MIN_SHIP_THRESHOLD" \
@@ -147,91 +112,46 @@ parse_metrics() {
     fi
 }
 
-# Returns 0 (success) if F1 and min_positive both meet targets.
-# Uses awk for float comparison — no python3 dependency on the Jenkins host.
-quality_ok() {
-    local f1="${WAKE_F1:-0}"
-    local min_pos="${WAKE_MIN_POS:-0}"
-    [[ -z "$f1" || "$f1" == "0" ]] && return 1
-    awk -v f1="$f1" -v min_pos="$min_pos" \
-        -v min_f1="$MIN_F1" -v min_pos_thr="$MIN_POSITIVE_SCORE" \
-        'BEGIN { exit (f1 >= min_f1 && min_pos >= min_pos_thr) ? 0 : 1 }'
-}
-
-# ── Training loop ─────────────────────────────────────────────────────────────
-ATTEMPT=0
-SKIP_TTS_FLAG=""        # empty on first run; "--skip_tts" from attempt 2 onwards
+# ── Single training run ────────────────────────────────────────────────────────
 WAKE_THRESHOLD=""
 WAKE_F1=""
 WAKE_GAP=""
 WAKE_MIN_POS=""
 WAKE_MAX_NEG=""
 
-while true; do
-    MAX_STEPS=${STEPS_SCHEDULE[$ATTEMPT]:-12000}
-    echo ""
-    echo "--- Training attempt $((ATTEMPT + 1)) / $((MAX_RETRAIN + 1))"
-    echo "    max_steps=$MAX_STEPS  skip_tts=${SKIP_TTS_FLAG:-no}"
-
-    # shellcheck disable=SC2086
-    sudo docker run --rm \
-        -v "$WAKEWORD_DIR:/app" \
-        -e AZURE_KEY="$AZURE_KEY" \
-        haivakanishk/wakeword-trainer \
-        --wake_word "$WAKE_WORD" \
-        --azure_key "$AZURE_KEY" \
-        --force_retrain \
-        --max_steps "$MAX_STEPS" \
-        $SKIP_TTS_FLAG \
-        2>&1 | tee "$TRAIN_LOG"
-
-    parse_metrics "$TRAIN_LOG"
-
-    if [[ -z "$WAKE_MIN_POS" || -z "$WAKE_MAX_NEG" ]]; then
-        echo "Error: could not parse min_positive / max_negative from training output."
-        echo "Last 20 lines of training log:"
-        tail -20 "$TRAIN_LOG"
-        exit 1
-    fi
-
-    echo ""
-    echo "  Attempt $((ATTEMPT + 1)) results:"
-    echo "    threshold (midpoint) = ${WAKE_THRESHOLD:-?}"
-    echo "    min_positive         = ${WAKE_MIN_POS:-?}  (need >= $MIN_POSITIVE_SCORE)"
-    echo "    max_negative         = ${WAKE_MAX_NEG:-?}  (info only)"
-    echo "    gap                  = ${WAKE_GAP:-?}  (info only)"
-    echo "    F1                   = ${WAKE_F1:-?}  (need >= $MIN_F1)"
-
-    if quality_ok; then
-        echo "  ✓ Quality OK — proceeding to Flutter build."
-        break
-    fi
-
-    # Print which check(s) failed
-    awk -v f1="${WAKE_F1:-0}" -v min_pos="${WAKE_MIN_POS:-0}" \
-        -v min_f1="$MIN_F1" -v min_pos_thr="$MIN_POSITIVE_SCORE" \
-        'BEGIN {
-            if (f1      < min_f1)      print "  ✗ F1 too low:               " f1      " < " min_f1
-            if (min_pos < min_pos_thr) print "  ✗ Weakest positive too low: " min_pos " < " min_pos_thr " (model not confident on positives)"
-        }'
-
-    if [[ $ATTEMPT -ge $MAX_RETRAIN ]]; then
-        echo ""
-        echo "  ⚠ WARNING: quality still insufficient after $((MAX_RETRAIN + 1)) attempts."
-        echo "  Continuing with best model found (threshold=${WAKE_THRESHOLD:-?})."
-        echo "  min_positive=${WAKE_MIN_POS:-?}  max_negative=${WAKE_MAX_NEG:-?}"
-        echo "  Consider adding real voice recordings to output_${WAKE_SLUG}/negatives/real/"
-        break
-    fi
-
-    ATTEMPT=$((ATTEMPT + 1))
-    SKIP_TTS_FLAG="--skip_tts"   # reuse existing TTS data — no Azure API cost
-    echo "  Retraining without TTS (${STEPS_SCHEDULE[$ATTEMPT]:-12000} steps)…"
-done
-
+MAX_STEPS=${MAX_STEPS:-5000}
 
 echo ""
-echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
+echo "--- Training wake word model (max_steps=$MAX_STEPS)"
+
+sudo docker run --rm \
+    -v "$WAKEWORD_DIR:/app" \
+    -e AZURE_KEY="$AZURE_KEY" \
+    haivakanishk/wakeword-trainer \
+    --wake_word "$WAKE_WORD" \
+    --azure_key "$AZURE_KEY" \
+    --force_retrain \
+    --max_steps "$MAX_STEPS" \
+    2>&1 | tee "$TRAIN_LOG"
+
+parse_metrics "$TRAIN_LOG"
+
+if [[ -z "$WAKE_MIN_POS" || -z "$WAKE_MAX_NEG" ]]; then
+    echo "Error: could not parse metrics from training output."
+    echo "Last 20 lines of training log:"
+    tail -20 "$TRAIN_LOG"
+    exit 1
+fi
+
+echo ""
+echo "Training results:"
+echo "  threshold = ${WAKE_THRESHOLD:-?}"
+echo "  F1        = ${WAKE_F1:-?}"
+echo "  gap       = ${WAKE_GAP:-?}"
+echo "  min_pos   = ${WAKE_MIN_POS:-?}"
+echo "  max_neg   = ${WAKE_MAX_NEG:-?}"
+echo ""
+echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
 
 # ── Step 2: Copy trained TFLite model into Flutter assets ─────────────────────
 echo ""
