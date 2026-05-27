@@ -100,9 +100,11 @@ _GENERIC_NEGATIVES = [
     "yes", "no", "okay", "hello", "goodbye", "stop", "start", "wait", "go", "help",
 ]
 
-# Fixed list of alternative leading words (phonetically diverse)
+# Fixed list of alternative leading words (phonetically diverse).
+# Includes ALL common wake-word openers so that any wake word — "hey X",
+# "hi X", "hello X", "okay X" — gets the others generated as hard negatives.
 _ALT_PREFIXES = [
-    "say", "okay", "hi", "hello", "play", "they", "oh",
+    "hey", "hi", "okay", "hello", "say", "play", "they", "oh",
     "pray", "day", "way", "pay", "stay",
 ]
 
@@ -143,39 +145,85 @@ def _mutate_trailing(word: str) -> list:
 
 def build_specific_negatives(wake_word: str) -> list:
     """
-    Wake-word-specific hard negatives only — phrases that require TTS because
-    they contain words from the wake word itself (prefix swaps, suffix swaps,
-    phonetic mutations, partial phrases).
+    Build wake-word-specific hard negatives for ANY wake word phrase.
 
-    Generic phrases (hey google, alexa, etc.) are NOT included here — those
-    already exist in shared_data/ and are reused without re-generating TTS.
+    Works generically regardless of the leading syllable — "hey X", "hi X",
+    "hello X", "okay X", etc. all get the same treatment.
+
+    Five categories of negatives are generated:
+
+    1. Leading-word swaps  — every _ALT_PREFIX replacing the first token
+       e.g. "hi kanishk" → "hey kanishk", "say kanishk", "hello kanishk", …
+            "hey haiva"  → "hi haiva", "okay haiva", …
+
+    2. Trailing-word swaps — the real prefix + every _ALT_SUFFIX
+       e.g. "hey nova", "hey siri", "hey alexa", …
+
+    3. Phonetic mutations of the last word
+       e.g. "hey jaiva", "hey heove", …
+
+    4. All individual tokens + the prefix group alone
+       e.g. "kanishk", "hey"
+
+    5. Progressive truncations of EVERY token in the phrase (≥ 2 chars)
+       This is the key fix for early-trigger false positives like
+       "hey ka" / "hey kani" / "kani" firing before the word is complete.
+
+       For each token at position i, generates:
+         — the prefix up to position i  + progressive partial of token[i]
+         — the partial alone
+       Covers 2-token, 3-token, and longer wake words uniformly.
+
+    Generic phrases (hey google, alexa, good morning, etc.) are NOT listed here —
+    those already live in shared_data/true_negatives/ and are reused across all
+    wake words without regenerating TTS.
     """
     tokens = wake_word.lower().split()
     phrases = []
 
     if len(tokens) >= 2:
-        rest        = " ".join(tokens[1:])   # e.g. "haiva"
-        prefix_part = " ".join(tokens[:-1])  # e.g. "hey"
-        last        = tokens[-1]             # e.g. "haiva"
+        rest        = " ".join(tokens[1:])   # everything after the first token
+        prefix_part = " ".join(tokens[:-1])  # everything before the last token
+        last        = tokens[-1]             # final token
 
-        # 1. Swap leading word: "say haiva", "hi haiva", …
+        # ── 1. Leading-word swaps ─────────────────────────────────────────────
         for alt in _ALT_PREFIXES:
             if alt != tokens[0]:
                 phrases.append(f"{alt} {rest}")
 
-        # 2. Swap trailing word: "hey nova", "hey nora", …
+        # ── 2. Trailing-word swaps ────────────────────────────────────────────
         for alt in _ALT_SUFFIXES:
             if alt != last:
                 phrases.append(f"{prefix_part} {alt}")
 
-        # 3. Phonetic mutations of the trailing word: "hey heove", "hey jaiva", …
+        # ── 3. Phonetic mutations of the last token ───────────────────────────
         for mutant in _mutate_trailing(last):
             phrases.append(f"{prefix_part} {mutant}")
 
-        # 4. Partial phrases — the full sequence must be heard, not just one word
+        # ── 4. Isolated tokens and the prefix group ───────────────────────────
         for token in tokens:
-            phrases.append(token)           # e.g. "haiva" alone
-        phrases.append(prefix_part)         # e.g. "hey" alone
+            phrases.append(token)
+        phrases.append(prefix_part)          # e.g. "hey" alone, "hi" alone
+
+        # ── 5. Progressive truncations of every token (early-trigger fix) ─────
+        # For each token at index i, build:
+        #   • "prefix_up_to_i  partial" — e.g. "hey ka", "hey kan", "hey kani"
+        #   • "partial"                 — e.g. "ka", "kan", "kani" alone
+        # Minimum partial length = 2 characters (1-char is not phonetically useful).
+        #
+        # This covers all shapes:
+        #   2-token  "hey kanishk"  → "hey ka", "hey kan", … + "ka", "kan", …
+        #   2-token  "hi haiva"     → "hi ha", "hi hai", "hi haiv" + "ha", "hai", …
+        #   3-token  "hey hi there" → truncations of both "hi" and "there"
+        for tok_idx, token in enumerate(tokens):
+            # Build the phrase prefix that comes before this token
+            prefix_so_far = " ".join(tokens[:tok_idx])   # empty string when tok_idx==0
+
+            for char_idx in range(2, len(token)):         # "ka", "kan", …  (skip 1-char)
+                partial = token[:char_idx]
+                if prefix_so_far:
+                    phrases.append(f"{prefix_so_far} {partial}")
+                phrases.append(partial)                   # standalone partial
 
     wake_lower = wake_word.lower()
     seen, result = set(), []
