@@ -213,6 +213,15 @@ while true; do
     echo "  Retraining without TTS (${STEPS_SCHEDULE[$ATTEMPT]:-12000} steps)…"
 done
 
+
+# Safety clamp: never ship a threshold below 0.5.
+# If the model is poor and midpoint < 0.5, it means scores overlap badly —
+# using it as-is would cause constant false positives from ambient noise.
+# Floor at 0.5 so the device is never dangerously hair-trigger.
+MIN_SHIP_THRESHOLD=${MIN_SHIP_THRESHOLD:-0.5}
+WAKE_THRESHOLD=$(awk -v t="${WAKE_THRESHOLD:-0.5}" -v floor="$MIN_SHIP_THRESHOLD" \
+    'BEGIN { printf "%.3f", (t < floor) ? floor : t }')
+
 echo ""
 echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
 
