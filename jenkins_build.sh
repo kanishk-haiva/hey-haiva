@@ -99,6 +99,19 @@ mkdir -p "$FLUTTER_DIR/assets/models/"
 cp "$TFLITE_SRC" "$TFLITE_DST"
 echo "Model copied: $TFLITE_SRC → $TFLITE_DST"
 
+# Register the model in pubspec.yaml if not already listed
+PUBSPEC="$FLUTTER_DIR/pubspec.yaml"
+ASSET_ENTRY="    - assets/models/${WAKE_SLUG}_float32.tflite"
+if ! grep -qF "$ASSET_ENTRY" "$PUBSPEC"; then
+    # Insert after the last existing tflite asset line
+    sed -i "s|    - assets/models/.*_float32\.tflite.*|&\n${ASSET_ENTRY}|" "$PUBSPEC"
+    # De-duplicate in case sed added it multiple times
+    awk '!seen[$0]++' "$PUBSPEC" > /tmp/pubspec_dedup.yaml && mv /tmp/pubspec_dedup.yaml "$PUBSPEC"
+    echo "pubspec.yaml updated: added $ASSET_ENTRY"
+else
+    echo "pubspec.yaml already contains $ASSET_ENTRY — skipping"
+fi
+
 # ── Step 3: Build Flutter APK ─────────────────────────────────────────────────
 echo ""
 echo "=== Step 3: Building Flutter APK ==="
