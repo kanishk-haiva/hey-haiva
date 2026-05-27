@@ -101,6 +101,7 @@ MIN_F1=${MIN_F1:-0.85}
 MIN_GAP=${MIN_GAP:--0.05}
 MIN_POSITIVE_SCORE=${MIN_POSITIVE_SCORE:-0.70}  # all positives must score > 0.70
 MAX_NEGATIVE_SCORE=${MAX_NEGATIVE_SCORE:-0.50}  # all negatives must score < 0.50
+MIN_SHIP_THRESHOLD=${MIN_SHIP_THRESHOLD:-0.50}  # shipped threshold floor (never hair-trigger)
 MAX_RETRAIN=${MAX_RETRAIN:-3}
 # Steps per attempt: [initial, retry-1, retry-2, retry-3]
 STEPS_SCHEDULE=(5000 7000 9000 12000)
@@ -116,12 +117,33 @@ parse_metrics() {
         | sed 's/.*= *\([0-9.]*\).*/\1/')
     WAKE_MAX_NEG=$(grep "max_negative" "$logfile" | tail -1 \
         | sed 's/.*= *\([0-9.]*\).*/\1/')
-    # Compute production threshold as midpoint between the two score boundaries.
-    # e.g. min_pos=0.945 max_neg=0.239 → threshold=0.592
-    # This gives clean margin on both sides and is safe to use on device.
+    # Compute a safe production threshold from the raw score boundaries:
+    #
+    #   raw = (min_pos + max_neg) / 2   — ideal midpoint
+    #   cap = min_pos × 0.90            — hard ceiling: threshold must always be
+    #                                     below the weakest positive so the wake word
+    #                                     still fires even from quieter real voices.
+    #                                     Without this, high max_neg (e.g. 0.996) can
+    #                                     push the midpoint above min_pos and the wake
+    #                                     word NEVER fires on device.
+    #   floor = MIN_SHIP_THRESHOLD      — hard floor (default 0.5): never hair-trigger
+    #
+    #   threshold = clamp(min(raw, cap), floor, cap)
+    #
+    # Examples:
+    #   Good model  min_pos=0.945 max_neg=0.239 → raw=0.592 cap=0.851 → 0.592 ✓
+    #   High neg    min_pos=0.882 max_neg=0.996 → raw=0.939 cap=0.794 → 0.794 ✓
+    #   Bad model   min_pos=0.200 max_neg=0.932 → raw=0.566 cap=0.180 → 0.500 (floored) ✓
     if [[ -n "$WAKE_MIN_POS" && -n "$WAKE_MAX_NEG" ]]; then
         WAKE_THRESHOLD=$(awk -v p="$WAKE_MIN_POS" -v n="$WAKE_MAX_NEG" \
-            'BEGIN { printf "%.3f", (p + n) / 2.0 }')
+            -v floor="$MIN_SHIP_THRESHOLD" \
+            'BEGIN {
+                raw = (p + n) / 2.0
+                cap = p * 0.90
+                t   = (raw < cap) ? raw : cap
+                t   = (t  > floor) ? t  : floor
+                printf "%.3f", t
+            }')
     fi
 }
 
@@ -213,14 +235,6 @@ while true; do
     echo "  Retraining without TTS (${STEPS_SCHEDULE[$ATTEMPT]:-12000} steps)…"
 done
 
-
-# Safety clamp: never ship a threshold below 0.5.
-# If the model is poor and midpoint < 0.5, it means scores overlap badly —
-# using it as-is would cause constant false positives from ambient noise.
-# Floor at 0.5 so the device is never dangerously hair-trigger.
-MIN_SHIP_THRESHOLD=${MIN_SHIP_THRESHOLD:-0.5}
-WAKE_THRESHOLD=$(awk -v t="${WAKE_THRESHOLD:-0.5}" -v floor="$MIN_SHIP_THRESHOLD" \
-    'BEGIN { printf "%.3f", (t < floor) ? floor : t }')
 
 echo ""
 echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
