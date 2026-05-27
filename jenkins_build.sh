@@ -125,9 +125,16 @@ echo "Model copied: $TFLITE_SRC → $TFLITE_DST"
 PUBSPEC="$FLUTTER_DIR/pubspec.yaml"
 ASSET_ENTRY="    - assets/models/${WAKE_SLUG}_float32.tflite"
 if ! grep -qF "$ASSET_ENTRY" "$PUBSPEC"; then
-    sed -i "s|    - assets/models/.*_float32\.tflite.*|&\n${ASSET_ENTRY}|" "$PUBSPEC"
-    awk '!seen[$0]++' "$PUBSPEC" > /tmp/pubspec_dedup.yaml && mv /tmp/pubspec_dedup.yaml "$PUBSPEC"
-    echo "pubspec.yaml updated: added $ASSET_ENTRY"
+    # Find line number of LAST existing _float32.tflite entry and insert after it only once
+    LAST_LINE=$(grep -n "_float32\.tflite" "$PUBSPEC" | tail -1 | cut -d: -f1)
+    if [[ -n "$LAST_LINE" ]]; then
+        awk -v n="$LAST_LINE" -v entry="$ASSET_ENTRY" \
+            'NR==n{print; print entry; next}1' "$PUBSPEC" > /tmp/pubspec_new.yaml \
+            && mv /tmp/pubspec_new.yaml "$PUBSPEC"
+        echo "pubspec.yaml updated: added $ASSET_ENTRY"
+    else
+        echo "WARNING: no tflite model entries found in pubspec.yaml — cannot add $ASSET_ENTRY"
+    fi
 else
     echo "pubspec.yaml already contains $ASSET_ENTRY — skipping"
 fi
