@@ -84,14 +84,23 @@ sudo docker login --username $docker_user --password $dockercreds
 
 # ── Auto-retrain quality thresholds (override in Jenkins env if needed) ───────
 # Retrain (without new TTS) whenever the model fails any of these checks:
-#   MIN_F1        — harmonic mean of precision & recall on the validation set
-#   MIN_GAP       — (min positive score) − (max negative score); thin gap = risky
-#   MIN_THRESHOLD — best threshold found by sweep; < 0.4 means the model can't
-#                   cleanly separate classes and a low threshold is needed to pass
-#                   which causes lots of false positives from ambient noise
+#
+#   MIN_F1             — harmonic mean of precision & recall on the validation set
+#   MIN_GAP            — (min_positive) − (max_negative); thin gap = risky in prod
+#   MIN_POSITIVE_SCORE — weakest positive must score above this; ensures the model
+#                        is confident enough that a safe threshold (>= 0.50) catches
+#                        all real wake words
+#   MAX_NEGATIVE_SCORE — strongest negative must score below this; ensures no
+#                        confusable phrase sneaks past a 0.50 threshold in production
+#
+# NOTE: we do NOT check the sweep's "best threshold" directly — that value is
+# always the LOWEST threshold achieving max F1, so a perfect model with
+# min_pos=0.94 and max_neg=0.24 would report threshold=0.25 (correct but
+# misleadingly low). Instead we verify the raw score boundaries directly.
 MIN_F1=${MIN_F1:-0.85}
 MIN_GAP=${MIN_GAP:--0.05}
-MIN_THRESHOLD=${MIN_THRESHOLD:-0.40}   # retrain if recommended threshold drops below this
+MIN_POSITIVE_SCORE=${MIN_POSITIVE_SCORE:-0.70}  # all positives must score > 0.70
+MAX_NEGATIVE_SCORE=${MAX_NEGATIVE_SCORE:-0.50}  # all negatives must score < 0.50
 MAX_RETRAIN=${MAX_RETRAIN:-3}
 # Steps per attempt: [initial, retry-1, retry-2, retry-3]
 STEPS_SCHEDULE=(5000 7000 9000 12000)
@@ -99,22 +108,34 @@ STEPS_SCHEDULE=(5000 7000 9000 12000)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 parse_metrics() {
     local logfile="$1"
-    WAKE_THRESHOLD=$(grep "Best threshold:" "$logfile" | tail -1 \
-        | sed 's/.*Best threshold: \([0-9.]*\).*/\1/')
     WAKE_F1=$(grep "Best threshold:" "$logfile" | tail -1 \
         | sed 's/.*F1=\([0-9.]*\).*/\1/')
     WAKE_GAP=$(grep "gap.*=" "$logfile" | tail -1 \
         | sed 's/.*= *\([+-][0-9.]*\).*/\1/')
+    WAKE_MIN_POS=$(grep "min_positive" "$logfile" | tail -1 \
+        | sed 's/.*= *\([0-9.]*\).*/\1/')
+    WAKE_MAX_NEG=$(grep "max_negative" "$logfile" | tail -1 \
+        | sed 's/.*= *\([0-9.]*\).*/\1/')
+    # Compute production threshold as midpoint between the two score boundaries.
+    # e.g. min_pos=0.945 max_neg=0.239 → threshold=0.592
+    # This gives clean margin on both sides and is safe to use on device.
+    if [[ -n "$WAKE_MIN_POS" && -n "$WAKE_MAX_NEG" ]]; then
+        WAKE_THRESHOLD=$(awk -v p="$WAKE_MIN_POS" -v n="$WAKE_MAX_NEG" \
+            'BEGIN { printf "%.3f", (p + n) / 2.0 }')
+    fi
 }
 
-# Returns 0 (success) if F1, gap, AND threshold all meet their minimums.
+# Returns 0 (success) if F1, gap, min_positive, and max_negative all meet targets.
 # Uses awk for float comparison — no python3 dependency on the Jenkins host.
 quality_ok() {
-    local f1="${WAKE_F1:-0}" gap="${WAKE_GAP:-0}" thr="${WAKE_THRESHOLD:-0}"
+    local f1="${WAKE_F1:-0}" gap="${WAKE_GAP:-0}"
+    local min_pos="${WAKE_MIN_POS:-0}" max_neg="${WAKE_MAX_NEG:-1}"
     [[ -z "$f1" || "$f1" == "0" ]] && return 1
-    awk -v f1="$f1" -v gap="$gap" -v thr="$thr" \
-        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" -v min_thr="$MIN_THRESHOLD" \
-        'BEGIN { exit (f1 >= min_f1 && gap >= min_gap && thr >= min_thr) ? 0 : 1 }'
+    awk -v f1="$f1" -v gap="$gap" \
+        -v min_pos="$min_pos" -v max_neg="$max_neg" \
+        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" \
+        -v min_pos_thr="$MIN_POSITIVE_SCORE" -v max_neg_thr="$MAX_NEGATIVE_SCORE" \
+        'BEGIN { exit (f1 >= min_f1 && gap >= min_gap && min_pos >= min_pos_thr && max_neg <= max_neg_thr) ? 0 : 1 }'
 }
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -123,6 +144,8 @@ SKIP_TTS_FLAG=""        # empty on first run; "--skip_tts" from attempt 2 onward
 WAKE_THRESHOLD=""
 WAKE_F1=""
 WAKE_GAP=""
+WAKE_MIN_POS=""
+WAKE_MAX_NEG=""
 
 while true; do
     MAX_STEPS=${STEPS_SCHEDULE[$ATTEMPT]:-12000}
@@ -144,8 +167,8 @@ while true; do
 
     parse_metrics "$TRAIN_LOG"
 
-    if [[ -z "$WAKE_THRESHOLD" ]]; then
-        echo "Error: could not parse threshold from training output."
+    if [[ -z "$WAKE_MIN_POS" || -z "$WAKE_MAX_NEG" ]]; then
+        echo "Error: could not parse min_positive / max_negative from training output."
         echo "Last 20 lines of training log:"
         tail -20 "$TRAIN_LOG"
         exit 1
@@ -153,9 +176,11 @@ while true; do
 
     echo ""
     echo "  Attempt $((ATTEMPT + 1)) results:"
-    echo "    threshold = $WAKE_THRESHOLD  (need >= $MIN_THRESHOLD)"
-    echo "    F1        = ${WAKE_F1:-?}  (need >= $MIN_F1)"
-    echo "    gap       = ${WAKE_GAP:-?}  (need >= $MIN_GAP)"
+    echo "    threshold (midpoint) = ${WAKE_THRESHOLD:-?}"
+    echo "    min_positive         = ${WAKE_MIN_POS:-?}  (need >= $MIN_POSITIVE_SCORE)"
+    echo "    max_negative         = ${WAKE_MAX_NEG:-?}  (need <= $MAX_NEGATIVE_SCORE)"
+    echo "    gap                  = ${WAKE_GAP:-?}  (need >= $MIN_GAP)"
+    echo "    F1                   = ${WAKE_F1:-?}  (need >= $MIN_F1)"
 
     if quality_ok; then
         echo "  ✓ Quality OK — proceeding to Flutter build."
@@ -163,19 +188,22 @@ while true; do
     fi
 
     # Print which check(s) failed
-    awk -v f1="${WAKE_F1:-0}" -v gap="${WAKE_GAP:-0}" -v thr="${WAKE_THRESHOLD:-0}" \
-        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" -v min_thr="$MIN_THRESHOLD" \
+    awk -v f1="${WAKE_F1:-0}" -v gap="${WAKE_GAP:-0}" \
+        -v min_pos="${WAKE_MIN_POS:-0}" -v max_neg="${WAKE_MAX_NEG:-1}" \
+        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" \
+        -v min_pos_thr="$MIN_POSITIVE_SCORE" -v max_neg_thr="$MAX_NEGATIVE_SCORE" \
         'BEGIN {
-            if (f1  < min_f1)  print "  ✗ F1 too low:        " f1  " < " min_f1
-            if (gap < min_gap) print "  ✗ Gap too narrow:    " gap " < " min_gap
-            if (thr < min_thr) print "  ✗ Threshold too low: " thr " < " min_thr \
-                " (model needs low threshold = thin margin = false positives from noise)"
+            if (f1      < min_f1)      print "  ✗ F1 too low:               " f1      " < " min_f1
+            if (gap     < min_gap)     print "  ✗ Gap too narrow:           " gap     " < " min_gap
+            if (min_pos < min_pos_thr) print "  ✗ Weakest positive too low: " min_pos " < " min_pos_thr " (model not confident on positives)"
+            if (max_neg > max_neg_thr) print "  ✗ Strongest negative too high: " max_neg " > " max_neg_thr " (a negative sounds too much like the wake word)"
         }'
 
     if [[ $ATTEMPT -ge $MAX_RETRAIN ]]; then
         echo ""
         echo "  ⚠ WARNING: quality still insufficient after $((MAX_RETRAIN + 1)) attempts."
-        echo "  Continuing with best model found (threshold=${WAKE_THRESHOLD})."
+        echo "  Continuing with best model found (threshold=${WAKE_THRESHOLD:-?})."
+        echo "  min_positive=${WAKE_MIN_POS:-?}  max_negative=${WAKE_MAX_NEG:-?}"
         echo "  Consider adding real voice recordings to output_${WAKE_SLUG}/negatives/real/"
         break
     fi
@@ -186,7 +214,7 @@ while true; do
 done
 
 echo ""
-echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?})"
+echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
 
 # ── Step 2: Copy trained TFLite model into Flutter assets ─────────────────────
 echo ""
