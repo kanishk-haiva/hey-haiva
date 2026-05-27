@@ -82,28 +82,111 @@ fi
 
 sudo docker login --username $docker_user --password $dockercreds
 
-# Run training inside container (has OpenSSL 1.1 — required by Azure Speech SDK)
-sudo docker run --rm \
-    -v "$WAKEWORD_DIR:/app" \
-    -e AZURE_KEY="$AZURE_KEY" \
-    haivakanishk/wakeword-trainer \
-    --wake_word "$WAKE_WORD" \
-    --azure_key "$AZURE_KEY" \
-    --force_retrain \
-    2>&1 | tee "$TRAIN_LOG"
+# ── Auto-retrain quality thresholds (override in Jenkins env if needed) ───────
+# Retrain (without new TTS) whenever the model fails any of these checks:
+#   MIN_F1        — harmonic mean of precision & recall on the validation set
+#   MIN_GAP       — (min positive score) − (max negative score); thin gap = risky
+#   MIN_THRESHOLD — best threshold found by sweep; < 0.4 means the model can't
+#                   cleanly separate classes and a low threshold is needed to pass
+#                   which causes lots of false positives from ambient noise
+MIN_F1=${MIN_F1:-0.85}
+MIN_GAP=${MIN_GAP:--0.05}
+MIN_THRESHOLD=${MIN_THRESHOLD:-0.40}   # retrain if recommended threshold drops below this
+MAX_RETRAIN=${MAX_RETRAIN:-3}
+# Steps per attempt: [initial, retry-1, retry-2, retry-3]
+STEPS_SCHEDULE=(5000 7000 9000 12000)
 
-# Parse the recommended threshold from "Best threshold: X.XXX  F1=..."
-WAKE_THRESHOLD=$(grep "Best threshold:" "$TRAIN_LOG" \
-    | tail -1 \
-    | sed 's/.*Best threshold: \([0-9.]*\).*/\1/')
+# ── Helpers ───────────────────────────────────────────────────────────────────
+parse_metrics() {
+    local logfile="$1"
+    WAKE_THRESHOLD=$(grep "Best threshold:" "$logfile" | tail -1 \
+        | sed 's/.*Best threshold: \([0-9.]*\).*/\1/')
+    WAKE_F1=$(grep "Best threshold:" "$logfile" | tail -1 \
+        | sed 's/.*F1=\([0-9.]*\).*/\1/')
+    WAKE_GAP=$(grep "gap.*=" "$logfile" | tail -1 \
+        | sed 's/.*= *\([+-][0-9.]*\).*/\1/')
+}
 
-if [[ -z "$WAKE_THRESHOLD" ]]; then
-    echo "Error: could not parse threshold from training output."
-    echo "Last 20 lines of training log:"
-    tail -20 "$TRAIN_LOG"
-    exit 1
-fi
-echo "Wake word threshold: $WAKE_THRESHOLD"
+# Returns 0 (success) if F1, gap, AND threshold all meet their minimums.
+# Uses awk for float comparison — no python3 dependency on the Jenkins host.
+quality_ok() {
+    local f1="${WAKE_F1:-0}" gap="${WAKE_GAP:-0}" thr="${WAKE_THRESHOLD:-0}"
+    [[ -z "$f1" || "$f1" == "0" ]] && return 1
+    awk -v f1="$f1" -v gap="$gap" -v thr="$thr" \
+        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" -v min_thr="$MIN_THRESHOLD" \
+        'BEGIN { exit (f1 >= min_f1 && gap >= min_gap && thr >= min_thr) ? 0 : 1 }'
+}
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+ATTEMPT=0
+SKIP_TTS_FLAG=""        # empty on first run; "--skip_tts" from attempt 2 onwards
+WAKE_THRESHOLD=""
+WAKE_F1=""
+WAKE_GAP=""
+
+while true; do
+    MAX_STEPS=${STEPS_SCHEDULE[$ATTEMPT]:-12000}
+    echo ""
+    echo "--- Training attempt $((ATTEMPT + 1)) / $((MAX_RETRAIN + 1))"
+    echo "    max_steps=$MAX_STEPS  skip_tts=${SKIP_TTS_FLAG:-no}"
+
+    # shellcheck disable=SC2086
+    sudo docker run --rm \
+        -v "$WAKEWORD_DIR:/app" \
+        -e AZURE_KEY="$AZURE_KEY" \
+        haivakanishk/wakeword-trainer \
+        --wake_word "$WAKE_WORD" \
+        --azure_key "$AZURE_KEY" \
+        --force_retrain \
+        --max_steps "$MAX_STEPS" \
+        $SKIP_TTS_FLAG \
+        2>&1 | tee "$TRAIN_LOG"
+
+    parse_metrics "$TRAIN_LOG"
+
+    if [[ -z "$WAKE_THRESHOLD" ]]; then
+        echo "Error: could not parse threshold from training output."
+        echo "Last 20 lines of training log:"
+        tail -20 "$TRAIN_LOG"
+        exit 1
+    fi
+
+    echo ""
+    echo "  Attempt $((ATTEMPT + 1)) results:"
+    echo "    threshold = $WAKE_THRESHOLD  (need >= $MIN_THRESHOLD)"
+    echo "    F1        = ${WAKE_F1:-?}  (need >= $MIN_F1)"
+    echo "    gap       = ${WAKE_GAP:-?}  (need >= $MIN_GAP)"
+
+    if quality_ok; then
+        echo "  ✓ Quality OK — proceeding to Flutter build."
+        break
+    fi
+
+    # Print which check(s) failed
+    awk -v f1="${WAKE_F1:-0}" -v gap="${WAKE_GAP:-0}" -v thr="${WAKE_THRESHOLD:-0}" \
+        -v min_f1="$MIN_F1" -v min_gap="$MIN_GAP" -v min_thr="$MIN_THRESHOLD" \
+        'BEGIN {
+            if (f1  < min_f1)  print "  ✗ F1 too low:        " f1  " < " min_f1
+            if (gap < min_gap) print "  ✗ Gap too narrow:    " gap " < " min_gap
+            if (thr < min_thr) print "  ✗ Threshold too low: " thr " < " min_thr \
+                " (model needs low threshold = thin margin = false positives from noise)"
+        }'
+
+    if [[ $ATTEMPT -ge $MAX_RETRAIN ]]; then
+        echo ""
+        echo "  ⚠ WARNING: quality still insufficient after $((MAX_RETRAIN + 1)) attempts."
+        echo "  Continuing with best model found (threshold=${WAKE_THRESHOLD})."
+        echo "  Consider adding real voice recordings to output_${WAKE_SLUG}/negatives/real/"
+        break
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+    SKIP_TTS_FLAG="--skip_tts"   # reuse existing TTS data — no Azure API cost
+    echo "  Retraining without TTS (${STEPS_SCHEDULE[$ATTEMPT]:-12000} steps)…"
+done
+
+echo ""
+echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  gap=${WAKE_GAP:-?})"
 
 # ── Step 2: Copy trained TFLite model into Flutter assets ─────────────────────
 echo ""
