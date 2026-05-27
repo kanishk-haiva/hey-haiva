@@ -157,6 +157,7 @@ dependency_overrides:
 EOF
 
 flutter clean
+rm -f pubspec.lock
 rm -rf ~/.pub-cache
 flutter pub get || { echo "flutter pub get failed"; exit 1; }
 
