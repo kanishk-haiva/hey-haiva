@@ -67,7 +67,7 @@ SAMPLE_RATE   = 16000
 CLIP_SAMPLES  = 32000           # 2 s @ 16 kHz
 CLIP_SECONDS  = CLIP_SAMPLES / SAMPLE_RATE   # 2.0
 
-TTS_COUNT      = 80             # TTS samples to generate for the exact wake word
+TTS_COUNT      = 150            # TTS samples to generate for the exact wake word
 AUGMENT_FACTOR = 12             # augmented copies per raw positive WAV
 NEG_VOICES     = 4              # TTS voices per hard-negative phrase
 
@@ -992,6 +992,47 @@ Examples:
                     phrase_dir = shared_neg_dir / phrase.replace(" ", "_")
                     tts_generate(phrase, phrase_dir, args.azure_key, args.azure_region,
                                  args.neg_voices)
+
+    # ── Step 3b: Augment wake-word-specific hard negatives ───────────────────
+    # Root cause of "hey" / "hey ka" triggering the wake word:
+    #   positives  = 80 TTS × 12 aug = 960 samples of "hey kanishk"
+    #   "hey" alone =  4 TTS × NO aug =   4 samples
+    #   ratio = 240 : 1 → model learns "hey" = positive
+    #
+    # Fix: augment the specific hard negatives (truncations + swaps) with the
+    # same pipeline used for positives.  This gives every partial phrase
+    # (hey, hey ka, hey kan, hey kani, …) the same ×AUGMENT_FACTOR treatment
+    # as the wake word itself, creating a balanced training signal.
+    #
+    # Only the SPECIFIC phrases for this wake word are augmented here — the
+    # 500+ generic shared phrases (hey google, alexa, …) already have enough
+    # diversity from their many TTS voices and are not augmented to keep
+    # training time reasonable.
+    specific_neg_wavs = []
+    for phrase in specific_phrases:
+        phrase_dir = shared_neg_dir / phrase.replace(" ", "_")
+        if phrase_dir.exists():
+            specific_neg_wavs.extend(list(phrase_dir.glob("*.wav")))
+
+    if specific_neg_wavs:
+        expected_spec_aug = len(specific_neg_wavs) * args.augment_factor
+        existing_spec_aug = list(neg_hard_dir.glob("*.wav")) if neg_hard_dir.exists() else []
+        if len(existing_spec_aug) >= expected_spec_aug and not args.force_retrain:
+            log.info(f"Step 3b: Specific hard-negative augmentation up to date "
+                     f"({len(existing_spec_aug)} files)")
+        else:
+            log.info(f"Step 3b: Augmenting {len(specific_neg_wavs)} specific hard negatives "
+                     f"× {args.augment_factor} "
+                     f"(fixes 'hey' / partial-phrase false positives)…")
+            if neg_hard_dir.exists():
+                shutil.rmtree(neg_hard_dir)
+            if pipeline is None:
+                pipeline = build_augment_pipeline(noise_dir)
+            augment_positives(specific_neg_wavs, neg_hard_dir, pipeline, args.augment_factor)
+            log.info(f"  Specific hard negatives after aug : "
+                     f"{len(list(neg_hard_dir.glob('*.wav')))} files")
+    else:
+        log.info("Step 3b: No specific hard negatives found to augment")
 
     # ── Step 4: Train ─────────────────────────────────────────────────────────
     if tflite_path.exists() and not args.force_retrain:
