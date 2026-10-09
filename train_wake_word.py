@@ -67,9 +67,12 @@ SAMPLE_RATE   = 16000
 CLIP_SAMPLES  = 32000           # 2 s @ 16 kHz
 CLIP_SECONDS  = CLIP_SAMPLES / SAMPLE_RATE   # 2.0
 
-TTS_COUNT      = 150            # TTS samples to generate for the exact wake word
+TTS_COUNT      = 900            # TTS samples to generate for the exact wake word
 AUGMENT_FACTOR = 12             # augmented copies per raw positive WAV
-NEG_VOICES     = 4              # TTS voices per hard-negative phrase
+NEG_VOICES     = 8              # TTS voices per hard-negative phrase
+TARGET_RMS     = 3000.0         # inference (listen.py / app) normalises each 2 s clip to this
+INDIAN_WEIGHT  = 5              # Indian voices are repeated this many times in the voice cycle
+INDIAN_LOCALES = {"en-IN", "hi-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "mr-IN", "bn-IN", "gu-IN"}
 
 VOICES = [
     "en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural",
@@ -82,8 +85,25 @@ VOICES = [
     "en-IE-EmilyNeural",  "en-IE-ConnorNeural",
     "en-NZ-MollyNeural",  "en-SG-LunaNeural",
 ]
-RATE_VALUES  = ["-10%", "-5%", "0%", "+5%", "+10%"]
-PITCH_VALUES = ["-5Hz", "0Hz", "+5Hz"]
+RATE_VALUES  = ["-25%", "-15%", "-8%", "0%", "+8%", "+15%", "+25%"]
+PITCH_VALUES = ["-12Hz", "-6Hz", "0Hz", "+6Hz", "+12Hz"]
+
+# Short everyday words that share sounds with typical wake words ("-oo",
+# "br-", Indian slang). "bro" and "bru" fired an early hey-groove model.
+_SHORT_WORD_NEGATIVES = [
+    "bro", "bruh", "bru", "hey bruh", "hey bru", "bro bro", "brother", "dude", "hey dude",
+    "true", "crew", "blue", "glue", "grew", "through", "who", "two", "zoo", "shoe",
+    "food", "mood", "cool", "school", "rule", "pool", "tool", "fool", "loop", "soup",
+    "yaar", "hey yaar", "machan", "da", "boss", "hey boss", "bhai", "hey bhai", "guru",
+    "brew", "broom", "bloom", "room", "roof", "proof", "truth", "huge", "news", "views",
+    "okay bro", "come on bro", "thank you bro", "what bro", "no bro", "yes bro",
+    "hey hi", "hey hello", "hey there", "hi bro", "hey everyone", "hey sir", "hey madam",
+]
+
+# Leading words that rhyme with "hey". As negatives for "hey X" they are
+# acoustically almost the wake word itself ("pay groove", "they groove") and
+# teaching the model to reject them cost recall on the real phrase.
+_HEY_RHYMES = {"they", "pay", "day", "way", "say", "play", "pray", "stay", "a"}
 
 # Generic phrases that must never trigger for any wake word
 _GENERIC_NEGATIVES = [
@@ -143,7 +163,8 @@ def _mutate_trailing(word: str) -> list:
     return [v for v in variants if v]
 
 
-def build_specific_negatives(wake_word: str) -> list:
+def build_specific_negatives(wake_word: str, keep_soundalikes: bool = False,
+                             extra: Optional[list] = None) -> list:
     """
     Build wake-word-specific hard negatives for ANY wake word phrase.
 
@@ -179,7 +200,7 @@ def build_specific_negatives(wake_word: str) -> list:
     wake words without regenerating TTS.
     """
     tokens = wake_word.lower().split()
-    phrases = []
+    phrases = list(_SHORT_WORD_NEGATIVES) + [e.strip().lower() for e in (extra or []) if e.strip()]
 
     if len(tokens) >= 2:
         rest        = " ".join(tokens[1:])   # everything after the first token
@@ -233,56 +254,119 @@ def build_specific_negatives(wake_word: str) -> list:
             seen.add(p)
             result.append(p)
 
+    if not keep_soundalikes:
+        before = len(result)
+        result = [p for p in result if not _is_soundalike(p, tokens)]
+        log.info(f"  Dropped {before - len(result)} near-homophones of the wake word "
+                 f"(use --keep_soundalikes to keep them)")
+
     log.info(f"  Wake-word-specific hard negatives: {len(result)} phrases")
     return result
 
 
+def _is_soundalike(phrase: str, wake_tokens: list) -> bool:
+    """True for negatives that are practically the wake word itself: a
+    "hey"-rhyme swapped in for the first word, or the last word cut short by
+    at most half ("hey gro"/"hey groo" for "hey groove")."""
+    if len(wake_tokens) < 2:
+        return False
+    toks = phrase.lower().split()
+    last = wake_tokens[-1]
+    if len(toks) == len(wake_tokens) and toks[1:] == wake_tokens[1:] and wake_tokens[0] == "hey" \
+            and toks[0] in _HEY_RHYMES:
+        return True
+    cand = toks[-1] if toks else ""
+    rest_ok = toks[:-1] in (wake_tokens[:-1], [])
+    if rest_ok and cand != last and last.startswith(cand) and len(cand) * 2 >= len(last):
+        return True
+    return False
+
+
 # ── TTS ───────────────────────────────────────────────────────────────────────
+# Azure REST API rather than the Speech SDK: no native library (the SDK
+# segfaults on some macOS Pythons) and easy to run in parallel.
+_TTS_WORKERS = 8
+
+
+def load_voices(azure_key: str, azure_region: str) -> list:
+    """Every English neural voice plus every Indian-language voice, Indian
+    ones repeated INDIAN_WEIGHT times and interleaved; falls back to VOICES."""
+    import requests
+    try:
+        r = requests.get(f"https://{azure_region}.tts.speech.microsoft.com/cognitiveservices/voices/list",
+                         headers={"Ocp-Apim-Subscription-Key": azure_key}, timeout=30)
+        r.raise_for_status()
+        allv = r.json()
+    except Exception as e:
+        log.warning(f"  Voice list unavailable ({e}) — using the built-in {len(VOICES)} voices")
+        return list(VOICES)
+    usable = [v for v in allv if ":" not in v["ShortName"] and "Multilingual" not in v["ShortName"]]
+    indian = sorted(v["ShortName"] for v in usable if v["Locale"] in INDIAN_LOCALES)
+    other = sorted(v["ShortName"] for v in usable
+                   if v["Locale"].startswith("en-") and v["Locale"] not in INDIAN_LOCALES)
+    rng = random.Random(1234)
+    ind_cycle = indian * INDIAN_WEIGHT
+    rng.shuffle(ind_cycle); rng.shuffle(other)
+    voices, oi = [], 0
+    for i, v in enumerate(ind_cycle):
+        voices.append(v)
+        if i % 2 == 1 and oi < len(other):
+            voices.append(other[oi]); oi += 1
+    voices += other[oi:]
+    share = len(ind_cycle) / max(1, len(voices))
+    log.info(f"  Voices: {len(indian)} Indian + {len(other)} other English "
+             f"({share:.0%} of samples Indian)")
+    return voices
+
+
+def _tts_one(ssml: str, out: Path, azure_key: str, azure_region: str) -> bool:
+    import requests
+    for attempt in range(4):
+        try:
+            r = requests.post(f"https://{azure_region}.tts.speech.microsoft.com/cognitiveservices/v1",
+                              headers={"Ocp-Apim-Subscription-Key": azure_key,
+                                       "Content-Type": "application/ssml+xml",
+                                       "X-Microsoft-OutputFormat": "riff-16khz-16bit-mono-pcm",
+                                       "User-Agent": "wakeword-train"},
+                              data=ssml.encode("utf-8"), timeout=30)
+            if r.status_code == 200 and len(r.content) > 1000:
+                tmp = out.with_suffix(".part")
+                tmp.write_bytes(r.content)
+                tmp.rename(out)
+                return True
+        except Exception:
+            pass
+        time.sleep(1.5 * (attempt + 1))
+    return False
+
+
 def tts_generate(phrase: str, output_dir: Path,
                  azure_key: str, azure_region: str,
-                 count: int = TTS_COUNT) -> list:
-    """Generate TTS WAVs for a phrase. Already-existing files are skipped."""
-    try:
-        import azure.cognitiveservices.speech as speechsdk
-    except ImportError:
-        log.error("pip install azure-cognitiveservices-speech")
-        sys.exit(1)
-
+                 count: int = TTS_COUNT, is_wake_word: bool = False) -> list:
+    """Generate TTS WAVs for a phrase. Already-existing files are skipped.
+    The wake word walks the whole voice cycle; negatives start at a random
+    voice so different phrases get different speakers."""
+    from concurrent.futures import ThreadPoolExecutor
     output_dir.mkdir(parents=True, exist_ok=True)
-    cfg = speechsdk.SpeechConfig(subscription=azure_key, region=azure_region)
-    cfg.set_speech_synthesis_output_format(
-        speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
-    )
-
-    generated, new_n, cached_n = [], 0, 0
-    for i in tqdm(range(count), desc=f"TTS [{phrase[:30]}]", leave=False):
+    start = 0 if is_wake_word else random.randrange(len(VOICES))
+    jobs, existing = [], []
+    for i in range(count):
         out = output_dir / f"tts_{i:05d}.wav"
         if out.exists() and out.stat().st_size > 0:
-            generated.append(out)
-            cached_n += 1
+            existing.append(out)
             continue
-
-        voice = VOICES[new_n % len(VOICES)]
-        rate  = random.choice(RATE_VALUES)
-        pitch = random.choice(PITCH_VALUES)
-        ssml = (
-            f"<speak version='1.0' xml:lang='en-US'>"
-            f"<voice name='{voice}'>"
-            f"<prosody rate='{rate}' pitch='{pitch}'>{phrase}</prosody>"
-            f"</voice></speak>"
-        )
-        audio_cfg = speechsdk.audio.AudioOutputConfig(filename=str(out))
-        synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=audio_cfg)
-        result = synth.speak_ssml_async(ssml).get()
-
-        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-            generated.append(out)
-            new_n += 1
-        else:
-            log.warning(f"TTS failed [{phrase}] sample {i}: {result.reason}")
-        time.sleep(0.05)
-
-    log.info(f"  TTS [{phrase}]: {new_n} new + {cached_n} cached = {len(generated)} files")
+        voice = VOICES[(start + i) % len(VOICES)]
+        ssml = (f"<speak version='1.0' xml:lang='en-US'><voice name='{voice}'>"
+                f"<prosody rate='{random.choice(RATE_VALUES)}' pitch='{random.choice(PITCH_VALUES)}'>"
+                f"{phrase}</prosody></voice></speak>")
+        jobs.append((ssml, out, voice))
+    with ThreadPoolExecutor(_TTS_WORKERS) as ex:
+        ok = list(ex.map(lambda j: _tts_one(j[0], j[1], azure_key, azure_region), jobs))
+    for (_, _, voice), good in zip(jobs, ok):
+        if not good:
+            log.warning(f"TTS failed [{phrase}] {voice}")
+    generated = existing + [j[1] for j, good in zip(jobs, ok) if good]
+    log.info(f"  TTS [{phrase}]: {sum(ok)} new + {len(existing)} cached = {len(generated)} files")
     return generated
 
 
@@ -349,12 +433,28 @@ def augment_positives(raw_files: list, output_dir: Path,
             end = min(offset + len(aug), CLIP_SAMPLES)
             clip[offset:end] = aug[:end - offset]
 
-            out = output_dir / f"{src.stem}_aug{j:03d}.wav"
+            # Phrase folders all start at tts_00000.wav, so the folder name
+            # keeps their augmentations from overwriting each other.
+            out = output_dir / f"{src.parent.name}__{src.stem}_aug{j:03d}.wav"
             sf.write(str(out), clip, SAMPLE_RATE)
             out_files.append(out)
 
     log.info(f"  Augmented: {len(out_files)} clips from {len(raw_files)} raw files")
     return out_files
+
+
+def _normalize_batches(gen):
+    """RMS-normalise every 2 s row to TARGET_RMS, exactly like listen.py and
+    the app do before scoring. Without it a quiet room, amplified at
+    inference, is audio the model never saw in training."""
+    for batch in gen:
+        b = np.asarray(batch).astype(np.float64)
+        rms = np.sqrt(np.mean(b * b, axis=1, keepdims=True))
+        scale = np.where(rms > 0, TARGET_RMS / np.maximum(rms, 1e-9), 1.0)
+        yield np.trunc(np.clip(b * scale, -32768, 32767)).astype(np.int16)
+
+
+_FEATURE_CPUS = max(1, min(4, os.cpu_count() or 1))
 
 
 # ── Feature extraction ────────────────────────────────────────────────────────
@@ -407,7 +507,8 @@ def extract_features(wav_paths: list, npy_path: Path, label: str):
 
     log.info(f"  [{label}] Extracting features from {len(wav_paths)} WAVs…")
     compute_features_from_generator(
-        _wav_batch_gen(wav_paths),
+        _normalize_batches(_wav_batch_gen(wav_paths)),
+        ncpu=_FEATURE_CPUS,
         n_total=len(wav_paths),
         output_file=str(npy_path),
         device="cpu",
@@ -546,7 +647,8 @@ def train_model(wake_word: str,
                 max_steps: int,
                 warmup_steps: int,
                 hold_steps: int,
-                val_split: float = 0.15) -> Path:
+                val_split: float = 0.15,
+                easy_noise_dir: Optional[Path] = None) -> Path:
     try:
         import torch
         from openwakeword.train import Model
@@ -608,20 +710,14 @@ def train_model(wake_word: str,
     easy_neg = None
     easy_npy = features_dir / "librispeech.npy"
     libri_dir = Path("./datasets/librispeech")
-    noise_dir = Path("./datasets/noise")
-    if libri_dir.exists() and negative_audio_generator:
+    noise_dir = easy_noise_dir if easy_noise_dir and easy_noise_dir.exists() else Path("./datasets/noise")
+    if libri_dir.exists():
         if not easy_npy.exists():
-            log.info("Extracting LibriSpeech easy negatives (one-time, ~5 min)…")
-            gen = negative_audio_generator(
-                dataset_dirs=[libri_dir],
-                noise_dirs=[noise_dir] if noise_dir.exists() else None,
-                max_files=10000,
-                mix_noise_prob=0.8,
-                batch_size=32,
-            )
+            log.info("Extracting LibriSpeech easy negatives (one-time)…")
+            gen = _speech_crops(libri_dir, noise_dir, n=10000)
             compute_features_from_generator(
-                gen, n_total=10000, output_file=str(easy_npy),
-                device="cpu", clip_duration=CLIP_SAMPLES,
+                _normalize_batches(gen), n_total=10000, output_file=str(easy_npy),
+                device="cpu", clip_duration=CLIP_SAMPLES, ncpu=_FEATURE_CPUS,
             )
         else:
             log.info("  Reusing cached LibriSpeech features")
@@ -647,8 +743,9 @@ def train_model(wake_word: str,
         log.error("Zero negative training examples.")
         sys.exit(1)
 
+    # 25% positives per batch; at 40% the model fired on everyday speech.
     train_gen = make_train_gen(train_pos, train_neg, easy_neg,
-                               n_pos=32, n_hard=32, n_easy=16)
+                               n_pos=24, n_hard=40, n_easy=32)
     val_gen   = make_val_batches(val_pos, val_neg, n_per=32)
 
     oww = _patch_oww_val_guard(
@@ -670,6 +767,46 @@ def train_model(wake_word: str,
     onnx_path = model_out / f"{model_name}.onnx"
     log.info(f"  ONNX saved: {onnx_path}")
     return onnx_path
+
+
+def _speech_crops(libri_dir: Path, noise_dir: Path, n: int, batch_size: int = 32):
+    """n random 2 s crops of conversational speech (many per file, not just
+    the opening 2 s), half mixed with noise at 0–15 dB SNR, every 7th crop
+    pure noise/babble. Yields int16 batches."""
+    rng = np.random.default_rng(77)
+    files = sorted(libri_dir.rglob("*.flac"))
+    noises = []
+    for p in sorted(noise_dir.glob("*.wav")) if noise_dir.exists() else []:
+        try:
+            a, _sr = sf.read(str(p), dtype="float64", always_2d=True)
+            noises.append(a[:, 0])
+        except Exception:
+            pass
+
+    def crop(a):
+        if len(a) <= CLIP_SAMPLES:
+            return np.pad(a, (0, CLIP_SAMPLES - len(a)))
+        o = rng.integers(0, len(a) - CLIP_SAMPLES)
+        return a[o:o + CLIP_SAMPLES]
+
+    batch = []
+    for i in range(n):
+        if noises and i % 7 == 6:
+            x = crop(noises[rng.integers(len(noises))])
+        else:
+            a, _sr = sf.read(str(files[rng.integers(len(files))]), dtype="float64", always_2d=True)
+            x = crop(a[:, 0])
+            if noises and rng.random() < 0.5:
+                nz = crop(noises[rng.integers(len(noises))])
+                ps, pn = np.mean(x ** 2) + 1e-9, np.mean(nz ** 2) + 1e-9
+                x = x + nz * np.sqrt(ps / (pn * 10 ** (rng.uniform(0, 15) / 10)))
+        x = x / (np.abs(x).max() + 1e-9) * 0.7
+        batch.append((x * 32767).astype(np.int16))
+        if len(batch) == batch_size:
+            yield np.vstack(batch)
+            batch = []
+    if batch:
+        yield np.vstack(batch)
 
 
 # ── TFLite export ─────────────────────────────────────────────────────────────
@@ -847,17 +984,23 @@ Examples:
                         help=f"Augmentations per raw positive WAV (default: {AUGMENT_FACTOR})")
     parser.add_argument("--neg_voices",     type=int, default=NEG_VOICES,
                         help=f"TTS voices per hard-negative phrase (default: {NEG_VOICES})")
-    parser.add_argument("--max_steps",      type=int, default=5000,
-                        help="Training steps (default: 5000)")
-    parser.add_argument("--warmup_steps",   type=int, default=500,
-                        help="LR warmup steps (default: 500)")
-    parser.add_argument("--hold_steps",     type=int, default=1500,
-                        help="LR hold steps (default: 1500)")
+    parser.add_argument("--max_steps",      type=int, default=12000,
+                        help="Training steps (default: 12000)")
+    parser.add_argument("--warmup_steps",   type=int, default=1000,
+                        help="LR warmup steps (default: 1000)")
+    parser.add_argument("--hold_steps",     type=int, default=4000,
+                        help="LR hold steps (default: 4000)")
     parser.add_argument("--shared_dir",     default="./shared_data",
                         help="Shared generic negatives dir reused across wake words "
                              "(default: ./shared_data)")
     parser.add_argument("--noise_dir",      default="",
                         help="Directory of WAVs used as background noise during augmentation")
+    parser.add_argument("--extra_negatives", default="",
+                        help="Comma-separated extra phrases that must NOT trigger "
+                             "(e.g. 'hey groovy,hey crew,in the groove')")
+    parser.add_argument("--keep_soundalikes", action="store_true",
+                        help="Keep near-homophones of the wake word as negatives "
+                             "('pay groove', 'hey groo'); off by default, they hurt recall")
     parser.add_argument("--output_dir",     default="",
                         help="Root output directory (default: ./output_{slug})")
     args = parser.parse_args()
@@ -879,6 +1022,8 @@ Examples:
     model_dir      = root / "model"
     tflite_dir     = root / "tflite"
     noise_dir      = Path(args.noise_dir) if args.noise_dir else None
+    if noise_dir is None and Path("./datasets/noise").exists():
+        noise_dir = Path("./datasets/noise")
 
     tflite_path  = tflite_dir / f"{_slug}_float32.tflite"
     onnx_path    = model_dir  / f"{_slug}.onnx"
@@ -888,6 +1033,10 @@ Examples:
     log.info(f"  Output    : {root.resolve()}")
     log.info(f"  TFLite    : {tflite_path}")
     log.info("=" * 60)
+
+    global VOICES
+    if args.azure_key and not args.skip_tts:
+        VOICES = load_voices(args.azure_key, args.azure_region)
 
     # ── Step 1: Positive WAVs (TTS or existing) ───────────────────────────────
     pos_raw_dir.mkdir(parents=True, exist_ok=True)
@@ -905,7 +1054,8 @@ Examples:
                       f"{pos_raw_dir} and re-run with --skip_tts.")
             sys.exit(1)
         log.info(f"Step 1: Generating {args.tts_count} TTS samples for '{ww}'…")
-        tts_generate(ww, pos_raw_dir, args.azure_key, args.azure_region, args.tts_count)
+        tts_generate(ww, pos_raw_dir, args.azure_key, args.azure_region, args.tts_count,
+                     is_wake_word=True)
         existing_pos = list(pos_raw_dir.glob("*.wav"))
 
     # ── Step 2: Augment positives ─────────────────────────────────────────────
@@ -963,7 +1113,9 @@ Examples:
     # ── Step 3: Hard negatives ────────────────────────────────────────────────
     # All hard negatives (generic + wake-word-specific) are stored in shared_data/
     # true_negatives/ so they are generated once and reused for every wake word.
-    specific_phrases = build_specific_negatives(ww)
+    specific_phrases = build_specific_negatives(
+        ww, keep_soundalikes=args.keep_soundalikes,
+        extra=args.extra_negatives.split(",") if args.extra_negatives else None)
 
     shared_count = len(list(shared_neg_dir.rglob("*.wav"))) if shared_neg_dir.exists() else 0
     log.info(f"Step 3: Shared negatives: {shared_count} WAVs in {shared_neg_dir}")
@@ -1052,6 +1204,7 @@ Examples:
             max_steps=args.max_steps,
             warmup_steps=args.warmup_steps,
             hold_steps=args.hold_steps,
+            easy_noise_dir=noise_dir,
         )
 
         # ── Step 5: Export TFLite ─────────────────────────────────────────────

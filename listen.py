@@ -79,7 +79,14 @@ def list_devices():
 parser = argparse.ArgumentParser(description="Live wake word detection from microphone")
 parser.add_argument("--wake_word",  default="hey haiva",  help="Wake word phrase")
 parser.add_argument("--model",      default="",           help="Explicit TFLite model path")
-parser.add_argument("--threshold",  type=float, default=0.09, help="Detection threshold (0–1)")
+parser.add_argument("--threshold",  type=float, default=0.5, help="Detection threshold (0–1)")
+parser.add_argument("--rule", choices=["avg", "ema"], default="avg",
+                    help="avg: mean of the last --avg_frames scores (same as the Android app); "
+                         "ema: exponential moving average (older behaviour)")
+parser.add_argument("--avg_frames", type=int, default=15,
+                    help="Frames averaged by --rule avg (15 x 100 ms = 1.5 s)")
+parser.add_argument("--save_below", action="store_true",
+                    help="Also save every below-threshold 2 s chunk (about 2 GB per hour)")
 parser.add_argument("--device",     type=int,   default=None, help="Mic device index (omit = default)")
 parser.add_argument("--list",       action="store_true",  help="List audio input devices and exit")
 parser.add_argument("--cooldown",   type=float, default=1.5,
@@ -137,7 +144,7 @@ print(f"  Wake word : {args.wake_word}")
 print(f"  Model     : {model_path}")
 print(f"  Threshold : {THRESHOLD}")
 print(f"  Cooldown  : {COOLDOWN}s")
-print(f"  Min hits  : {MIN_HITS} consecutive frame(s)")
+print(f"  Rule      : {'mean of last %d frames' % args.avg_frames if args.rule == 'avg' else 'EMA alpha %s, %d consecutive frame(s)' % (EMA_ALPHA, MIN_HITS)}")
 print(f"  Input     : {list(inp_detail['shape'])}  dtype={inp_detail['dtype'].__name__}")
 print("=" * 55)
 print("\nListening… (Ctrl+C to stop)\n")
@@ -190,6 +197,9 @@ t.start()
 
 # ── Sliding window detection loop ─────────────────────────────────────────────
 window: deque = deque(maxlen=CLIP_SAMPLES)   # keeps last 2 s of samples
+recent: deque = deque(maxlen=args.avg_frames)
+if args.rule == "avg":
+    MIN_HITS = 1
 last_trigger = 0.0
 ema_score    = 0.0    # exponential moving average of raw scores
 was_above    = False  # tracks whether previous frame was above threshold
@@ -207,8 +217,14 @@ try:
         audio_clip = np.array(window, dtype=np.int16)
         score = score_audio(audio_clip)
 
-        # EMA smoothing — reduces single-frame noise spikes
-        ema_score = EMA_ALPHA * score + (1 - EMA_ALPHA) * ema_score
+        if args.rule == "avg":
+            # Real speakers give many high-but-jumpy frames across the word;
+            # near-misses like "bro" give a short burst. A 1.5 s mean separates them.
+            recent.append(score)
+            ema_score = sum(recent) / len(recent) if len(recent) == recent.maxlen else 0.0
+        else:
+            # EMA smoothing — reduces single-frame noise spikes
+            ema_score = EMA_ALPHA * score + (1 - EMA_ALPHA) * ema_score
 
         now = time.time()
         timestamp = time.strftime("%H:%M:%S")
@@ -227,11 +243,13 @@ try:
                 last_trigger = now
                 was_above    = False   # require a new rising edge for next trigger
                 frames_above = 0
-                ema_score    = 0.0    # reset EMA so next event must re-cross
+                score_at_trigger = ema_score
+                ema_score    = 0.0    # reset so the next event must re-cross
+                recent.clear()
                 bar = "█" * int(score * 20)
                 wav_path = _save_chunk(audio_clip, score, timestamp)
                 msg = (f"[{timestamp}]  WAKE WORD DETECTED!  "
-                       f"score={score:.4f}  ema={ema_score:.4f}  "
+                       f"score={score:.4f}  {args.rule}={score_at_trigger:.4f}  "
                        f"|{bar:<20}|  -> {wav_path}")
                 print(msg)
                 _log(msg)
@@ -240,7 +258,7 @@ try:
                 bar = "▒" * int(ema_score * 20)
                 state = "cooldown" if in_cooldown else f"rising({frames_above}/{MIN_HITS})"
                 msg = (f"[{timestamp}]  {state:<14} "
-                       f"score={score:.4f}  ema={ema_score:.4f}  |{bar:<20}|")
+                       f"score={score:.4f}  {args.rule}={ema_score:.4f}  |{bar:<20}|")
                 print(msg)
                 _log(msg)
         else:
@@ -249,9 +267,9 @@ try:
                 was_above    = False
                 frames_above = 0
             bar = "░" * int(score * 20)
-            wav_path = _save_chunk(audio_clip, score, timestamp, below=True)
+            wav_path = _save_chunk(audio_clip, score, timestamp, below=True) if args.save_below else "(not saved)"
             msg = (f"[{timestamp}]  below          "
-                   f"score={score:.4f}  ema={ema_score:.4f}  "
+                   f"score={score:.4f}  {args.rule}={ema_score:.4f}  "
                    f"|{bar:<20}|  -> {wav_path}")
             print(msg)
             _log(msg)

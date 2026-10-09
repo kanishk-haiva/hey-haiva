@@ -47,7 +47,7 @@ echo "  AGENT_ID     : $AGENT_ID"
 echo "  WORKSPACE_ID : $WORKSPACE_ID"
 echo "  ORG_ID       : $ORG_ID"
 echo "  AGENT_NAME   : $AGENT_NAME"
-echo "  AZURE_KEY    : $AZURE_KEY"
+echo "  AZURE_KEY    : ${AZURE_KEY:0:4}…(masked)"
 echo "  WAKE_WORD    : $WAKE_WORD"
 echo "  WAKEWORD_DIR : $WAKEWORD_DIR"
 
@@ -119,7 +119,7 @@ WAKE_GAP=""
 WAKE_MIN_POS=""
 WAKE_MAX_NEG=""
 
-MAX_STEPS=${MAX_STEPS:-5000}
+MAX_STEPS=${MAX_STEPS:-12000}
 
 echo ""
 echo "--- Training wake word model (max_steps=$MAX_STEPS)"
@@ -151,7 +151,12 @@ echo "  gap       = ${WAKE_GAP:-?}"
 echo "  min_pos   = ${WAKE_MIN_POS:-?}"
 echo "  max_neg   = ${WAKE_MAX_NEG:-?}"
 echo ""
-echo "Wake word threshold: $WAKE_THRESHOLD  (F1=${WAKE_F1:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
+# The app (like listen.py) fires on the mean of the last 15 frame scores, so
+# the threshold is for that average, not the per-clip raw scores above.
+# Override with a wakeThreshold job parameter after tuning with listen.py.
+WAKE_THRESHOLD=${wakeThreshold:-0.5}
+WAKE_AVG_FRAMES=${wakeAvgFrames:-15}
+echo "Wake word threshold: $WAKE_THRESHOLD on a ${WAKE_AVG_FRAMES}-frame average  (validation F1=${WAKE_F1:-?}  min_pos=${WAKE_MIN_POS:-?}  max_neg=${WAKE_MAX_NEG:-?})"
 
 # ── Step 2: Copy trained TFLite model into Flutter assets ─────────────────────
 echo ""
@@ -236,6 +241,7 @@ flutter build apk \
     --dart-define=AGENT_PLATFORM="$AGENT_PLATFORM" \
     --dart-define=WAKE_WORD="$WAKE_SLUG" \
     --dart-define=WAKE_THRESHOLD="$WAKE_THRESHOLD" \
+    --dart-define=WAKE_AVG_FRAMES="$WAKE_AVG_FRAMES" \
     --target=lib/main.dart
 
 # Rename and archive APK
